@@ -1,0 +1,12 @@
+# Node.js / JavaScript / TypeScript
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+.pnpm-debug.log
+
+# Вже має бути з попереднього повідомлення, але на всяк випадок
+bin/
+obj/
+.vscode/
+.vs/
