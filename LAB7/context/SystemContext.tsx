@@ -1,17 +1,17 @@
 import React, { createContext, useState, useEffect, useContext, ReactNode } from 'react';
+import { ApiService } from '../services/ApiService';
 import { generateSensorData } from '../services/SensorGenerator';
-import { insertSensorData, getRecentLogs } from '../services/Database';
-import { initDB } from '../services/Database';
+import { insertSensorData, getRecentLogs, initDB } from '../services/Database';
 import { syncDataToCloud } from '../services/Firebase';
 import { SensorData, DeviceState, RuleThresholds, Statistics } from '../types';
 
 interface SystemContextType {
   currentData: SensorData | null;
-  history: SensorData[]; 
+  history: SensorData[];
   deviceState: DeviceState;
   logs: SensorData[];
-  stats: Statistics;   
-  thresholds: RuleThresholds; 
+  stats: Statistics;
+  thresholds: RuleThresholds;
   isAutoMode: boolean;
   isOnline: boolean;
   isSimulatedOffline: boolean;
@@ -20,7 +20,7 @@ interface SystemContextType {
   toggleAutoMode: () => void;
   toggleFogLights: () => void;
   setLedBrightness: (val: number) => void;
-  updateThresholds: (key: keyof RuleThresholds, val: number) => void; 
+  updateThresholds: (key: keyof RuleThresholds, val: number) => void;
 }
 
 const SystemContext = createContext<SystemContextType | undefined>(undefined);
@@ -32,9 +32,7 @@ export const SystemProvider = ({ children }: { children: ReactNode }) => {
   const [logs, setLogs] = useState<SensorData[]>([]);
   
   const [thresholds, setThresholds] = useState<RuleThresholds>({
-    luxTarget: 10000,
-    visibilityLimit: 30,
-    motionTimeout: 5000
+    luxTarget: 10000, visibilityLimit: 30, motionTimeout: 5000
   });
 
   const [isAutoMode, setIsAutoMode] = useState(true);
@@ -46,82 +44,107 @@ export const SystemProvider = ({ children }: { children: ReactNode }) => {
 
   const calculateStats = (data: SensorData[]): Statistics => {
     if (data.length === 0) return { count: 0, averageLux: 0, medianLux: 0, trend: 'STABLE' };
-    
     const luxValues = data.map(d => d.illuminance);
     const sum = luxValues.reduce((a, b) => a + b, 0);
     const avg = sum / luxValues.length;
-
     const sorted = [...luxValues].sort((a, b) => a - b);
     const mid = Math.floor(sorted.length / 2);
     const median = sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-
-    const firstHalf = luxValues.slice(0, Math.floor(luxValues.length / 2));
-    const secondHalf = luxValues.slice(Math.floor(luxValues.length / 2));
-    const avg1 = firstHalf.reduce((a, b) => a + b, 0) / (firstHalf.length || 1);
-    const avg2 = secondHalf.reduce((a, b) => a + b, 0) / (secondHalf.length || 1);
     
+    const half = Math.floor(luxValues.length / 2);
+    const avg1 = luxValues.slice(0, half).reduce((a,b)=>a+b,0)/half;
+    const avg2 = luxValues.slice(half).reduce((a,b)=>a+b,0)/(luxValues.length-half);
     let trend: 'UP' | 'DOWN' | 'STABLE' = 'STABLE';
-    if (avg2 > avg1 + 500) trend = 'UP';
-    if (avg2 < avg1 - 500) trend = 'DOWN';
+    if (avg2 > avg1 + 100) trend = 'UP'; else if (avg2 < avg1 - 100) trend = 'DOWN';
 
     return { count: logs.length, averageLux: avg, medianLux: median, trend };
   };
 
   useEffect(() => {
     const interval = setInterval(async () => {
-      const newData = generateSensorData(currentData || undefined);
+      let newData: SensorData | null = null;
+      let connectionStatus = false;
+
+      if (!isSimulatedOffline) {
+        newData = await ApiService.fetchSensorData();
+      }
+
+      if (newData) {
+        connectionStatus = true;
+        const serverState = await ApiService.fetchDeviceState();
+        if (serverState) setDeviceState(serverState);
+
+      } else {
+        newData = generateSensorData(currentData || undefined);
+        connectionStatus = false;
+      }
+
       setCurrentData(newData);
-      
+      setIsOnline(connectionStatus);
+
       setHistory(prev => {
-        const newHist = [...prev, newData];
+        const newHist = [...prev, newData!];
         return newHist.length > 50 ? newHist.slice(1) : newHist;
       });
 
-      if (isAutoMode) {
+      if (isAutoMode && newData) {
         if (newData.motion) setLastMotionTime(Date.now());
         const timeSinceMotion = Date.now() - lastMotionTime;
 
         let brightness = 0;
         if (newData.illuminance < thresholds.luxTarget) {
-          if (newData.motion || timeSinceMotion < thresholds.motionTimeout) {
-            brightness = 100;
-          } else {
-            brightness = 20;
-          }
+            brightness = (newData.motion || timeSinceMotion < thresholds.motionTimeout) ? 100 : 20;
         }
         const fog = newData.visibility < thresholds.visibilityLimit;
-        setDeviceState({ ledBrightness: brightness, fogLights: fog });
+
+        if (connectionStatus) {
+            if (brightness !== deviceState.ledBrightness || fog !== deviceState.fogLights) {
+                 ApiService.updateDeviceState({ ledBrightness: brightness, fogLights: fog });
+                 setDeviceState({ ledBrightness: brightness, fogLights: fog });
+            }
+        } else {
+            setDeviceState({ ledBrightness: brightness, fogLights: fog });
+        }
       }
 
-      await insertSensorData(newData);
+      await insertSensorData(newData!);
 
-      if (isSimulatedOffline) {
-        setIsOnline(false);
-      } else {
-        const syncResult = await syncDataToCloud();
-        setIsOnline(syncResult);
+
+      if (connectionStatus && !isSimulatedOffline) {
+        await syncDataToCloud();
       }
 
-      getRecentLogs((fetchedLogs) => setLogs(fetchedLogs));
+      getRecentLogs(setLogs);
 
     }, 2000);
-    return () => clearInterval(interval);
-  }, [currentData, isAutoMode, lastMotionTime, isSimulatedOffline, thresholds]);
 
-  const toggleAutoMode = () => setIsAutoMode(p => !p);
-  const toggleFogLights = () => setDeviceState(p => ({ ...p, fogLights: !p.fogLights }));
-  const setLedBrightness = (v: number) => setDeviceState(p => ({ ...p, ledBrightness: v }));
+    return () => clearInterval(interval);
+  }, [currentData, isAutoMode, lastMotionTime, isSimulatedOffline, thresholds, deviceState]);
+
   const toggleOfflineSimulation = () => setIsSimulatedOffline(p => !p);
-  
-  const updateThresholds = (key: keyof RuleThresholds, val: number) => {
-    setThresholds(prev => ({...prev, [key]: val}));
+  const toggleAutoMode = () => setIsAutoMode(p => !p);
+  const updateThresholds = (key: keyof RuleThresholds, val: number) => setThresholds(p => ({...p, [key]: val}));
+
+  const toggleFogLights = async () => {
+    const newState = !deviceState.fogLights;
+    setDeviceState(p => ({ ...p, fogLights: newState })); 
+    if (isOnline && !isSimulatedOffline) {
+        await ApiService.updateDeviceState({ fogLights: newState });
+    }
+  };
+
+  const setLedBrightness = async (val: number) => {
+    setDeviceState(p => ({ ...p, ledBrightness: val }));
+    if (isOnline && !isSimulatedOffline) {
+        await ApiService.updateDeviceState({ ledBrightness: val });
+    }
   };
 
   return (
     <SystemContext.Provider value={{ 
       currentData, history, deviceState, logs, 
       isAutoMode, isOnline, isSimulatedOffline,
-      thresholds, stats: calculateStats(history), 
+      thresholds, stats: calculateStats(history),
       toggleOfflineSimulation, toggleAutoMode, toggleFogLights, setLedBrightness, updateThresholds
     }}>
       {children}
